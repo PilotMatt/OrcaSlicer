@@ -8,6 +8,7 @@
 #include <boost/log/trivial.hpp>
 
 #include <cstdlib>
+#include <slic3r/plugin/PluginManager.hpp>
 #include <utility>
 
 namespace Slic3r {
@@ -97,6 +98,7 @@ ScopedPluginAuditContext::ScopedPluginAuditContext(const std::string& plugin_key
     PluginAuditManager::instance().set_current_capability(capability_name);
     PluginAuditManager::instance().set_audit_mode(mode);
     PluginAuditManager::m_scoped_allowed_roots.clear();
+    PluginAuditManager::instance().add_scoped_allowed_root(PluginManager::instance().get_storage_dir(plugin_key));
 }
 
 ScopedPluginAuditContext::~ScopedPluginAuditContext()

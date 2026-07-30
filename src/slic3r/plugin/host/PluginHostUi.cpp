@@ -7,6 +7,7 @@
 #include <slic3r/GUI/GUI_App.hpp>
 #include <slic3r/GUI/MainFrame.hpp>
 #include <slic3r/GUI/MsgDialog.hpp>
+#include <slic3r/GUI/NotificationManager.hpp>
 #include <slic3r/GUI/PluginProgressDialog.hpp>
 #include <slic3r/GUI/PluginWebDialog.hpp>
 
@@ -14,6 +15,7 @@
 #include <pybind11/pybind11.h>
 
 #include <boost/log/trivial.hpp>
+#include <boost/filesystem.hpp>
 
 #include <wx/app.h>
 #include <wx/defs.h>
@@ -98,6 +100,51 @@ GUI::PluginWebDialog::SubmitHandler make_submit_adapter(py::object on_submit)
             holder->fn(json_to_py(data));
         } catch (py::error_already_set& e) {
             BOOST_LOG_TRIVIAL(error) << "orca.host.ui on_submit handler raised: " << e.what();
+            PyErr_Clear();
+        }
+    };
+}
+
+GUI::PluginWebDialog::DownloadHandler default_download_handler()
+{
+    return [](const json& data) {
+        if (wxTheApp == nullptr || GUI::wxGetApp().plater() == nullptr)
+            return;
+
+        auto *notifications = GUI::wxGetApp().plater()->get_notification_manager();
+        if (notifications == nullptr)
+            return;
+
+        if (data.value("success", false)) {
+            const boost::filesystem::path path(data.value("path", std::string()));
+            if (!path.empty() && !path.parent_path().empty()) {
+                notifications->push_import_finished_notification(
+                    path.string(), path.parent_path().string(), false);
+            }
+            return;
+        }
+
+        const std::string error = data.value("error", std::string("Download failed."));
+        notifications->push_notification(
+            GUI::NotificationType::CustomNotification,
+            GUI::NotificationManager::NotificationLevel::WarningNotificationLevel,
+            std::string("Download failed: ") + error);
+    };
+}
+
+GUI::PluginWebDialog::DownloadHandler make_download_adapter(py::object on_download_complete)
+{
+    CallablePtr holder = make_holder(std::move(on_download_complete));
+    if (!holder)
+        return default_download_handler();
+    return [holder](const json& data) {
+        PythonGILState gil;
+        if (!gil)
+            return;
+        try {
+            holder->fn(json_to_py(data));
+        } catch (py::error_already_set& e) {
+            BOOST_LOG_TRIVIAL(error) << "orca.host.ui on_download_complete handler raised: " << e.what();
             PyErr_Clear();
         }
     };
@@ -277,18 +324,23 @@ struct UiProgressHandle
 };
 
 py::object ui_create_window(const std::string& html, const std::string& title, int width, int height,
-                            py::object on_message, py::object on_close, long style, py::object on_submit)
+                            py::object on_message, py::object on_close, long style, py::object on_submit,
+                            py::object on_download_complete, const std::string& url)
 {
-    auto              msg_adapter    = make_message_adapter(std::move(on_message));
-    auto              submit_adapter = make_submit_adapter(std::move(on_submit));
-    CallablePtr       close_holder   = make_holder(std::move(on_close));
-    const std::string plugin_key     = PluginAuditManager::instance().current_plugin();
-    const int         w              = width > 0 ? width : 820;
-    const int         h              = height > 0 ? height : 600;
+    auto              msg_adapter      = make_message_adapter(std::move(on_message));
+    auto              submit_adapter   = make_submit_adapter(std::move(on_submit));
+    auto              download_adapter = make_download_adapter(std::move(on_download_complete));
+    CallablePtr       close_holder     = make_holder(std::move(on_close));
+    const std::string plugin_key       = PluginAuditManager::instance().current_plugin();
+    const int         w                = width > 0 ? width : 820;
+    const int         h                = height > 0 ? height : 600;
 
     if ((style & ~WINDOW_MODAL) != 0)
         throw std::invalid_argument("unsupported orca.host.ui.create_window style flags");
     const bool modal = (style & WINDOW_MODAL) != 0;
+
+    if (html.empty() == url.empty())
+        throw std::invalid_argument("orca.host.ui.create_window requires exactly one of html or url");
 
     if (wxTheApp == nullptr)
         throw std::runtime_error("OrcaSlicer application is not initialized");
@@ -313,9 +365,10 @@ py::object ui_create_window(const std::string& html, const std::string& title, i
     const int new_id = UiRegistry::instance().reserve_id();
     UiRegistry::instance().bind(new_id, nullptr, plugin_key);
 
-    GUI::wxGetApp().CallAfter([new_id, plugin_key, html, title, w, h,
+    GUI::wxGetApp().CallAfter([new_id, plugin_key, html, url, title, w, h,
                                msg_adapter = std::move(msg_adapter),
                                submit_adapter = std::move(submit_adapter),
+                               download_adapter = std::move(download_adapter),
                                close_holder = std::move(close_holder), modal]() mutable {
         // Torn down (plugin unload / app shutdown) before the window materialized.
         if (!UiRegistry::instance().is_open(new_id))
@@ -340,8 +393,9 @@ py::object ui_create_window(const std::string& html, const std::string& title, i
         // Registry cleanup: GIL-free, runs from the dialog destructor on every path.
         auto on_destroyed = [new_id]() { UiRegistry::instance().remove(new_id); };
 
-        auto* dlg = new GUI::PluginWebDialog(ui_parent(), wxString::FromUTF8(title), html,
+        auto* dlg = new GUI::PluginWebDialog(ui_parent(), wxString::FromUTF8(title), plugin_key, html, url,
                                              wxSize(w, h), std::move(msg_adapter), std::move(submit_adapter),
+                                             std::move(download_adapter),
                                              std::move(on_close), std::move(on_destroyed), PLUGIN_WX_STYLE);
         UiRegistry::instance().bind(new_id, dlg, plugin_key);
         if (modal) {
@@ -487,12 +541,15 @@ void PluginHostUi::RegisterBindings(pybind11::module_& host)
             "is_open", [](const UiWindowHandle& h) { return UiRegistry::instance().is_open(h.id); },
             "Return True while the window is open.");
 
-    ui.def("create_window", &ui_create_window, py::arg("html"), py::arg("title") = "OrcaSlicer", py::arg("width") = 820,
+    ui.def("create_window", &ui_create_window, py::arg("html") = "", py::arg("title") = "OrcaSlicer", py::arg("width") = 820,
            py::arg("height") = 600, py::arg("on_message") = py::none(), py::arg("on_close") = py::none(),
            py::arg("style") = WINDOW_MODELESS, py::arg("on_submit") = py::none(),
-           "Open a persistent HTML window or modal dialog and return a UiWindow. style is WINDOW_MODELESS "
-           "or WINDOW_MODAL. on_message(data) is called on the UI thread when the page posts; on_submit(data) "
-           "is called when the page submits; offload heavy work to a thread and push results back with window.post().");
+           py::arg("on_download_complete") = py::none(),
+           py::arg("url") = "",
+           "Open a persistent HTML window or modal dialog and return a UiWindow. Provide exactly one of html or url. "
+           "style is WINDOW_MODELESS or WINDOW_MODAL. on_message(data) is called on the UI thread when the page posts; on_submit(data) "
+           "is called when the page submits; on_download_complete(info) is called on the UI thread when a "
+           "download finishes or fails; offload heavy work to a thread and push results back with window.post().");
 
     py::class_<UiProgressHandle>(ui, "ProgressDialog", "Handle to a native progress dialog.")
         .def(py::init(&new_progress_dialog), py::arg("title"), py::arg("message"), py::arg("maximum") = 100,

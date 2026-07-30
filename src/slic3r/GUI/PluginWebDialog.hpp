@@ -12,8 +12,9 @@
 
 namespace Slic3r { namespace GUI {
 
-// A host-owned webview window that renders plugin-supplied raw HTML and bridges
-// messages to/from the page through a small injected `window.orca` API.
+// A host-owned webview window that renders plugin-supplied raw HTML or loads a
+// plugin-supplied URL and bridges messages to/from the page through a small
+// injected `window.orca` API.
 //
 // This class is deliberately Python-agnostic: it talks to the plugin layer only
 // through std::function hooks. Those hooks must NOT capture bare pybind11
@@ -26,18 +27,23 @@ class PluginWebDialog : public Slic3r::GUI::WebViewHostDialog
 public:
     using MessageHandler = std::function<void(const nlohmann::json& data)>;
     using SubmitHandler  = std::function<void(const nlohmann::json& data)>;
+    using DownloadHandler = std::function<void(const nlohmann::json& data)>;
     using CloseHandler   = std::function<void()>;
 
-    // on_submit fires once for window.orca.submit(). on_close fires only on a
-    // user/JS-initiated close (while the window is alive). on_destroyed runs from
-    // the destructor on every path and must touch host-side state only (no Python
-    // / no derived members).
+    // on_submit fires once for window.orca.submit(). on_download_complete fires once
+    // when a plugin download finishes or fails. on_close fires only on a user/JS-
+    // initiated close (while the window is alive). on_destroyed runs from the
+    // destructor on every path and must touch host-side state only (no Python / no
+    // derived members).
     PluginWebDialog(wxWindow*          parent,
                     const wxString&    title,
+                    const std::string& plugin_key,
                     const std::string& html,
+                    const std::string& url,
                     const wxSize&      size,
                     MessageHandler     on_message,
                     SubmitHandler      on_submit,
+                    DownloadHandler   on_download_complete,
                     CloseHandler       on_close,
                     CloseHandler       on_destroyed,
                     long               wx_style = wxSYSTEM_MENU | wxCAPTION | wxCLOSE_BOX | wxMAXIMIZE_BOX | wxRESIZE_BORDER);
@@ -71,6 +77,8 @@ private:
     void finish(bool submitted, const nlohmann::json& data);
 
     std::string                   m_html;
+    std::string                   m_url;
+    std::string                   m_plugin_key;
     bool                          m_content_loaded{false};
     bool                          m_open{true};
     bool                          m_close_fired{false};

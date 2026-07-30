@@ -908,7 +908,7 @@ if (UNIX AND NOT APPLE)
         target_link_libraries(libslic3r_gui ${X11_LIBRARIES} ${webkit2gtk_LIBRARIES})
     endif()
     target_include_directories(libslic3r_gui SYSTEM PRIVATE ${GTK${SLIC3R_GTK}_INCLUDE_DIRS} ${LIBSECRET_INCLUDE_DIRS} ${webkit2gtk_INCLUDE_DIRS})
-    target_link_libraries(libslic3r_gui ${GTK${SLIC3R_GTK}_LIBRARIES} fontconfig ${LIBSECRET_LIBRARIES})
+    target_link_libraries(libslic3r_gui ${GTK${SLIC3R_GTK}_LIBRARIES} fontconfig ${LIBSECRET_LIBRARIES} ${webkit2gtk_LIBRARIES})
 
     # Propagate GDK backend detection results as compile definitions so that
     # LinuxDisplayBackend.cpp can include the right GDK headers.
