@@ -11,7 +11,21 @@
 
 #include <wx/event.h>
 
+#ifdef __WIN32__
+#include <WebView2.h>
+#include <objbase.h>
+#ifdef __VISUALC__
+#include <wrl/event.h>
+using Microsoft::WRL::Callback;
+#else
+#include <wx/msw/private/comptr.h>
+#include <wx/msw/wrl/event.h>
+#endif
+#endif
+
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #ifdef __linux__
@@ -280,8 +294,261 @@ void enable_plugin_download_redirect(wxWebView* view, wxString target_dir, Plugi
     }
 }
 #elif defined(__WIN32__)
-void enable_plugin_download_redirect(wxWebView*, wxString, PluginDownloadCallback)
-{ throw std::runtime_error("Plugin webview download redirection is not implemented on Windows."); }
+
+std::wstring sanitize_plugin_download_filename(const wchar_t* suggested)
+{
+    std::wstring name;
+    try {
+        name = boost::filesystem::path(suggested ? suggested : L"").filename().wstring();
+    } catch (...) {
+        name.clear();
+    }
+
+    for (wchar_t& c : name) {
+        if (c < 0x20 || c == L'<' || c == L'>' || c == L':' || c == L'"' || c == L'/' || c == L'\\' ||
+            c == L'|' || c == L'?' || c == L'*')
+            c = L'_';
+    }
+    while (!name.empty() && (name.back() == L' ' || name.back() == L'.'))
+        name.pop_back();
+
+    if (name.empty() || name == L"." || name == L"..")
+        name = L"download";
+
+    // Windows reserves these device names even when an extension is present.
+    const std::wstring stem = boost::filesystem::path(name).stem().wstring();
+    const std::wstring upper_stem = [&stem] {
+        std::wstring value = stem;
+        for (wchar_t& c : value) {
+            if (c >= L'a' && c <= L'z')
+                c -= L'a' - L'A';
+        }
+        return value;
+    }();
+    if (upper_stem == L"CON" || upper_stem == L"PRN" || upper_stem == L"AUX" || upper_stem == L"NUL" ||
+        (upper_stem.size() == 4 && (upper_stem.substr(0, 3) == L"COM" || upper_stem.substr(0, 3) == L"LPT") &&
+         upper_stem[3] >= L'1' && upper_stem[3] <= L'9'))
+        name.insert(0, L"_");
+
+    return name;
+}
+
+boost::filesystem::path unique_plugin_download_path(const boost::filesystem::path& dir, const std::wstring& filename)
+{
+    const boost::filesystem::path base(filename);
+    const std::wstring stem            = base.stem().wstring();
+    const std::wstring ext             = base.extension().wstring();
+    boost::filesystem::path candidate  = dir / filename;
+    for (int n = 1; boost::filesystem::exists(candidate); ++n)
+        candidate = dir / (stem + L" (" + std::to_wstring(n) + L")" + ext);
+    return candidate;
+}
+
+struct PluginDownloadRedirectConfig
+{
+    wxString target_dir;
+    PluginDownloadCallback callback;
+};
+
+struct PluginDownloadSession
+{
+    wxString target_dir;
+    PluginDownloadCallback callback;
+    bool notified{false};
+    wxString resolved_filename;
+    wxString resolved_path;
+    wxString mime_type;
+};
+
+void notify_plugin_download(PluginDownloadSession& session, nlohmann::json info)
+{
+    if (session.notified)
+        return;
+    session.notified = true;
+    if (session.callback) {
+        try {
+            session.callback(info);
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(warning) << "PluginWebDialog: download callback failed: " << e.what();
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(warning) << "PluginWebDialog: download callback failed.";
+        }
+    }
+}
+
+void fail_plugin_download(PluginDownloadSession& session, const std::string& error)
+{
+    notify_plugin_download(session,
+                           {{"filename", std::string(session.resolved_filename.utf8_string())},
+                            {"path", ""},
+                            {"mimeType", std::string(session.mime_type.utf8_string())},
+                            {"size", 0},
+                            {"success", false},
+                            {"error", error}});
+}
+
+HRESULT on_plugin_download_state_changed(const std::shared_ptr<PluginDownloadSession>& session,
+                                          ICoreWebView2DownloadOperation* operation)
+{
+    try {
+        COREWEBVIEW2_DOWNLOAD_STATE state = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+        if (!operation || FAILED(operation->get_State(&state)))
+            return S_OK;
+        if (state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS)
+            return S_OK;
+
+        INT64 bytes_received = 0;
+        operation->get_BytesReceived(&bytes_received);
+        LPWSTR result_path = nullptr;
+        operation->get_ResultFilePath(&result_path);
+        if (result_path) {
+            session->resolved_path = wxString(result_path);
+            CoTaskMemFree(result_path);
+        }
+
+        if (state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED) {
+            notify_plugin_download(*session,
+                                   {{"filename", std::string(session->resolved_filename.utf8_string())},
+                                    {"path", std::string(session->resolved_path.utf8_string())},
+                                    {"mimeType", std::string(session->mime_type.utf8_string())},
+                                    {"size", bytes_received},
+                                    {"success", true},
+                                    {"error", ""}});
+        } else {
+            COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON reason =
+                COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NONE;
+            operation->get_InterruptReason(&reason);
+            fail_plugin_download(*session, "Download interrupted (" + std::to_string(static_cast<int>(reason)) + ").");
+        }
+    } catch (const std::exception& e) {
+        fail_plugin_download(*session, e.what());
+    } catch (...) {
+        fail_plugin_download(*session, "Download failed.");
+    }
+    return S_OK;
+}
+
+void cancel_plugin_download(ICoreWebView2DownloadStartingEventArgs* args, ICoreWebView2DownloadOperation* operation)
+{
+    if (args)
+        args->put_Cancel(TRUE);
+    if (args)
+        args->put_Handled(TRUE);
+    if (operation)
+        operation->Cancel();
+}
+
+HRESULT on_plugin_download_starting(ICoreWebView2DownloadStartingEventArgs* args,
+                                    const std::shared_ptr<PluginDownloadRedirectConfig>& config)
+{
+    ICoreWebView2DownloadOperation* operation = nullptr;
+    auto                             session  = std::make_shared<PluginDownloadSession>();
+    session->target_dir                       = config->target_dir;
+    session->callback                         = config->callback;
+
+    try {
+        if (!args || FAILED(args->get_DownloadOperation(&operation)))
+            throw std::runtime_error("Could not initialize the download operation.");
+
+        LPWSTR suggested_path = nullptr;
+        args->get_ResultFilePath(&suggested_path);
+        const std::wstring filename = sanitize_plugin_download_filename(suggested_path);
+        if (suggested_path)
+            CoTaskMemFree(suggested_path);
+        session->resolved_filename = wxString(filename);
+
+        LPWSTR mime_type = nullptr;
+        if (SUCCEEDED(operation->get_MimeType(&mime_type)) && mime_type) {
+            session->mime_type = wxString(mime_type);
+            CoTaskMemFree(mime_type);
+        }
+
+        if (session->target_dir.empty())
+            throw std::runtime_error("Plugin storage directory is unavailable.");
+
+        namespace fs = boost::filesystem;
+        const fs::path dir(std::wstring(session->target_dir.wc_str()));
+        fs::create_directories(dir);
+        if (!fs::is_directory(dir))
+            throw std::runtime_error("Could not create the plugin storage directory.");
+
+        const fs::path destination = unique_plugin_download_path(dir, filename);
+        session->resolved_path                       = wxString(destination.wstring());
+        if (FAILED(args->put_ResultFilePath(destination.wstring().c_str())))
+            throw std::runtime_error("Could not set the plugin download destination.");
+
+        auto state_handler = Callback<ICoreWebView2StateChangedEventHandler>(
+            [session](ICoreWebView2DownloadOperation* download, IUnknown*) {
+                return on_plugin_download_state_changed(session, download);
+            });
+        EventRegistrationToken token{};
+        const HRESULT state_result = operation->add_StateChanged(state_handler.Get(), &token);
+        if (FAILED(state_result))
+            throw std::runtime_error("Could not monitor the plugin download.");
+    } catch (const std::exception& e) {
+        cancel_plugin_download(args, operation);
+        fail_plugin_download(*session, e.what());
+    } catch (...) {
+        cancel_plugin_download(args, operation);
+        fail_plugin_download(*session, "Could not redirect the plugin download.");
+    }
+
+    if (operation)
+        operation->Release();
+    return S_OK;
+}
+
+void attach_plugin_download_redirect(wxWebView* view, const std::shared_ptr<PluginDownloadRedirectConfig>& config)
+{
+    auto* web_view = static_cast<ICoreWebView2*>(view->GetNativeBackend());
+    if (!web_view)
+        throw std::runtime_error("WebView2 is not ready for download redirection.");
+
+    ICoreWebView2_4* web_view_4 = nullptr;
+    const HRESULT query_result = web_view->QueryInterface(IID_ICoreWebView2_4,
+                                                           reinterpret_cast<void**>(&web_view_4));
+    if (FAILED(query_result) || !web_view_4)
+        throw std::runtime_error("WebView2 download interception is unavailable.");
+
+    auto handler = Callback<ICoreWebView2DownloadStartingEventHandler>(
+        [config](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) {
+            try {
+                return on_plugin_download_starting(args, config);
+            } catch (...) {
+                // COM event callbacks must not allow exceptions to escape into WebView2.
+                if (args)
+                    args->put_Cancel(TRUE);
+                return E_FAIL;
+            }
+        });
+    EventRegistrationToken token{};
+    const HRESULT add_result = web_view_4->add_DownloadStarting(handler.Get(), &token);
+    web_view_4->Release();
+    if (FAILED(add_result))
+        throw std::runtime_error("Could not register WebView2 download interception.");
+}
+
+void enable_plugin_download_redirect(wxWebView* view, wxString target_dir, PluginDownloadCallback callback)
+{
+    if (!view)
+        return;
+
+    auto config = std::make_shared<PluginDownloadRedirectConfig>(PluginDownloadRedirectConfig{std::move(target_dir), std::move(callback)});
+    if (view->GetNativeBackend()) {
+        attach_plugin_download_redirect(view, config);
+        return;
+    }
+
+    // WebView2 creates its native controller asynchronously. The created event is
+    // queued by wxWidgets after GetNativeBackend() becomes usable.
+    view->Bind(wxEVT_WEBVIEW_CREATED, [view, config](wxWebViewEvent&) {
+        try {
+            attach_plugin_download_redirect(view, config);
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(warning) << "PluginWebDialog: " << e.what();
+        }
+    });
+}
 #elif defined(__WXMAC__) || defined(__WXOSX__)
 void enable_plugin_download_redirect(wxWebView*, wxString, PluginDownloadCallback)
 { throw std::runtime_error("Plugin webview download redirection is not implemented on macOS."); }
