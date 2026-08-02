@@ -98,7 +98,13 @@ ScopedPluginAuditContext::ScopedPluginAuditContext(const std::string& plugin_key
     PluginAuditManager::instance().set_current_capability(capability_name);
     PluginAuditManager::instance().set_audit_mode(mode);
     PluginAuditManager::m_scoped_allowed_roots.clear();
-    PluginAuditManager::instance().add_scoped_allowed_root(PluginManager::instance().get_storage_dir(plugin_key));
+
+    // Test and diagnostic callers may use a synthetic plugin key that is not in the manager's
+    // registry.  Real plugin callbacks are always registered, so only add the storage root when
+    // the key resolves; an unregistered context remains restricted by the normal audit policy.
+    PluginDescriptor descriptor;
+    if (PluginManager::instance().try_get_plugin_descriptor(plugin_key, descriptor))
+        PluginAuditManager::instance().add_scoped_allowed_root(PluginManager::instance().get_storage_dir(plugin_key));
 }
 
 ScopedPluginAuditContext::~ScopedPluginAuditContext()
