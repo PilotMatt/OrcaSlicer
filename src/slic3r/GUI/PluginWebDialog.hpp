@@ -3,6 +3,8 @@
 
 #include "Widgets/WebViewHostDialog.hpp"
 
+#include <boost/filesystem/path.hpp>
+
 #include <functional>
 #include <optional>
 #include <string>
@@ -11,6 +13,32 @@
 #include <wx/webview.h>
 
 namespace Slic3r { namespace GUI {
+
+using PluginDownloadCallback = std::function<void(const nlohmann::json&)>;
+
+struct PluginDownloadRedirectConfig
+{
+    wxString              target_dir;
+    PluginDownloadCallback callback;
+};
+
+struct PluginDownloadSession
+{
+    wxString              target_dir;
+    PluginDownloadCallback callback;
+    bool                  notified{false};
+    wxString              resolved_filename;
+    wxString              resolved_path;
+    wxString              mime_type;
+    long long             size{0};
+};
+
+wxString sanitize_plugin_download_filename(const wxString& suggested);
+boost::filesystem::path unique_plugin_download_path(const boost::filesystem::path& dir,
+                                                     const boost::filesystem::path& filename);
+void notify_plugin_download(PluginDownloadSession& session, nlohmann::json info);
+void finish_plugin_download(PluginDownloadSession& session, long long size);
+void fail_plugin_download(PluginDownloadSession& session, const std::string& error);
 
 // A host-owned webview window that renders plugin-supplied raw HTML or loads a
 // plugin-supplied URL and bridges messages to/from the page through a small
@@ -27,7 +55,7 @@ class PluginWebDialog : public Slic3r::GUI::WebViewHostDialog
 public:
     using MessageHandler = std::function<void(const nlohmann::json& data)>;
     using SubmitHandler  = std::function<void(const nlohmann::json& data)>;
-    using DownloadHandler = std::function<void(const nlohmann::json& data)>;
+    using DownloadHandler = PluginDownloadCallback;
     using CloseHandler   = std::function<void()>;
 
     // on_submit fires once for window.orca.submit(). on_download_complete fires once

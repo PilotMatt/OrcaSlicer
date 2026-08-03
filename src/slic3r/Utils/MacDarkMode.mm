@@ -12,8 +12,232 @@
 
 #include <objc/runtime.h>
 
+#include <boost/filesystem.hpp>
+
+#include <memory>
+#include <stdexcept>
+#include <utility>
+
 @interface MacDarkMode : NSObject {}
 @end
+
+using Slic3r::GUI::PluginDownloadCallback;
+using Slic3r::GUI::PluginDownloadRedirectConfig;
+using Slic3r::GUI::PluginDownloadSession;
+using Slic3r::GUI::fail_plugin_download;
+using Slic3r::GUI::finish_plugin_download;
+using Slic3r::GUI::sanitize_plugin_download_filename;
+using Slic3r::GUI::unique_plugin_download_path;
+
+@interface OrcaWKDownloadContext : NSObject
+{
+@public
+    std::shared_ptr<PluginDownloadRedirectConfig> m_config;
+    NSMutableArray*                           m_download_delegates;
+}
+- (id)initWithConfig:(std::shared_ptr<PluginDownloadRedirectConfig>)config;
+- (void)removeDownloadDelegate:(id)delegate;
+@end
+
+@interface OrcaWKDownloadDelegate : NSObject <WKDownloadDelegate>
+{
+    OrcaWKDownloadContext* m_context;
+    std::shared_ptr<PluginDownloadSession> m_session;
+}
+- (id)initWithContext:(OrcaWKDownloadContext*)context;
+@end
+
+static char g_orca_wk_download_context_key;
+
+@implementation OrcaWKDownloadContext
+
+- (id)initWithConfig:(std::shared_ptr<PluginDownloadRedirectConfig>)config
+{
+    if ((self = [super init])) {
+        m_config             = std::move(config);
+        m_download_delegates = [[NSMutableArray alloc] init];
+    }
+    return self;
+}
+
+- (void)removeDownloadDelegate:(id)delegate
+{
+    [m_download_delegates removeObjectIdenticalTo:delegate];
+}
+
+- (void)dealloc
+{
+    [m_download_delegates release];
+    [super dealloc];
+}
+
+@end
+
+@implementation OrcaWKDownloadDelegate
+
+- (id)initWithContext:(OrcaWKDownloadContext*)context
+{
+    if ((self = [super init]))
+        m_context = context;
+    return self;
+}
+
+- (void)download:(WKDownload*)download
+    decideDestinationUsingResponse:(NSURLResponse*)response
+                  suggestedFilename:(NSString*)suggestedFilename
+                  completionHandler:(void (^)(NSURL* destinationURL))completionHandler
+{
+    (void)download;
+    m_session = std::make_shared<PluginDownloadSession>();
+    m_session->resolved_filename = sanitize_plugin_download_filename(suggestedFilename ? wxCFStringRef::AsString(suggestedFilename) : wxString());
+    m_session->mime_type = response.MIMEType ? wxCFStringRef::AsString(response.MIMEType) : wxString();
+    m_session->size      = response.expectedContentLength > 0 ? response.expectedContentLength : 0;
+    m_session->callback  = m_context->m_config->callback;
+
+    try {
+        if (m_context->m_config->target_dir.empty())
+            throw std::runtime_error("Plugin storage directory is unavailable.");
+
+        namespace fs = boost::filesystem;
+        const fs::path dir(std::string(m_context->m_config->target_dir.utf8_string()));
+        boost::system::error_code ec;
+        fs::create_directories(dir, ec);
+        if (ec || !fs::is_directory(dir, ec))
+            throw std::runtime_error("Could not create the plugin storage directory.");
+
+        const fs::path destination = unique_plugin_download_path(
+            dir, fs::path(std::string(m_session->resolved_filename.utf8_string())));
+        m_session->resolved_path = wxString::FromUTF8(destination.string());
+        const wxString destination_url = wxString::FromUTF8(destination.string());
+        if (completionHandler)
+            completionHandler([NSURL fileURLWithPath:wxCFStringRef(destination_url).AsNSString()]);
+    } catch (const std::exception& e) {
+        fail_plugin_download(*m_session, e.what());
+        if (completionHandler)
+            completionHandler(nil);
+    } catch (...) {
+        fail_plugin_download(*m_session, "Could not redirect the plugin download.");
+        if (completionHandler)
+            completionHandler(nil);
+    }
+}
+
+- (void)downloadDidFinish:(WKDownload*)download
+{
+    (void)download;
+    if (m_session)
+        finish_plugin_download(*m_session, m_session->size);
+    [m_context removeDownloadDelegate:self];
+}
+
+- (void)download:(WKDownload*)download didFailWithError:(NSError*)error resumeData:(NSData*)resumeData
+{
+    (void)download;
+    (void)resumeData;
+    if (m_session) {
+        const wxString message = error ? wxCFStringRef::AsString(error.localizedDescription) : wxString("Download failed.");
+        fail_plugin_download(*m_session, std::string(message.utf8_string()));
+    }
+    [m_context removeDownloadDelegate:self];
+}
+
+- (void)dealloc
+{
+    [super dealloc];
+}
+
+@end
+
+static OrcaWKDownloadContext* wk_download_context(WKWebView* webView)
+{
+    return (OrcaWKDownloadContext*)objc_getAssociatedObject(webView, &g_orca_wk_download_context_key);
+}
+
+static void wk_decide_navigation_response(WKWebView* webView,
+                                          WKNavigationResponse* response,
+                                          void (^decisionHandler)(WKNavigationResponsePolicy))
+{
+    OrcaWKDownloadContext* context = wk_download_context(webView);
+    if (!context) {
+        decisionHandler(WKNavigationResponsePolicyAllow);
+        return;
+    }
+
+    bool should_download = !response.canShowMIMEType;
+    if ([response.response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSString* disposition = [(NSHTTPURLResponse*)response.response valueForHTTPHeaderField:@"Content-Disposition"];
+        should_download = should_download ||
+            [disposition rangeOfString:@"attachment" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    }
+    decisionHandler(should_download ? WKNavigationResponsePolicyDownload : WKNavigationResponsePolicyAllow);
+}
+
+static void wk_did_become_download(WKWebView* webView, WKNavigationResponse*, WKDownload* download)
+{
+    OrcaWKDownloadContext* context = wk_download_context(webView);
+    if (!context)
+        return;
+
+    OrcaWKDownloadDelegate* delegate = [[OrcaWKDownloadDelegate alloc] initWithContext:context];
+    [context->m_download_delegates addObject:delegate];
+    [download setDelegate:delegate];
+    [delegate release];
+}
+
+static void wk_decide_navigation_response_imp(id,
+                                              SEL,
+                                              WKWebView* webView,
+                                              WKNavigationResponse* response,
+                                              void (^decisionHandler)(WKNavigationResponsePolicy))
+{
+    wk_decide_navigation_response(webView, response, decisionHandler);
+}
+
+static void wk_did_become_download_imp(id,
+                                       SEL,
+                                       WKWebView* webView,
+                                       WKNavigationResponse* response,
+                                       WKDownload* download)
+{
+    wk_did_become_download(webView, response, download);
+}
+
+static void wk_did_become_action_download_imp(id,
+                                              SEL,
+                                              WKWebView* webView,
+                                              WKNavigationAction* action,
+                                              WKDownload* download)
+{
+    (void)action;
+    OrcaWKDownloadContext* context = wk_download_context(webView);
+    if (!context)
+        return;
+    OrcaWKDownloadDelegate* delegate = [[OrcaWKDownloadDelegate alloc] initWithContext:context];
+    [context->m_download_delegates addObject:delegate];
+    [download setDelegate:delegate];
+    [delegate release];
+}
+
+static void install_wk_download_delegate_methods(WKWebView* webView)
+{
+    id navigationDelegate = webView.navigationDelegate;
+    if (!navigationDelegate)
+        return;
+
+    Class delegateClass = object_getClass(navigationDelegate);
+    class_addMethod(delegateClass,
+                    @selector(webView:decidePolicyForNavigationResponse:decisionHandler:),
+                    (IMP)wk_decide_navigation_response_imp,
+                    "v@:@@@");
+    class_addMethod(delegateClass,
+                    @selector(webView:navigationResponse:didBecomeDownload:),
+                    (IMP)wk_did_become_download_imp,
+                    "v@:@@@");
+    class_addMethod(delegateClass,
+                    @selector(webView:navigationAction:didBecomeDownload:),
+                    (IMP)wk_did_become_action_download_imp,
+                    "v@:@@@");
+}
 
 @implementation MacDarkMode
 
@@ -81,6 +305,19 @@ void set_title_colour_after_set_title(void * window)
   if (mainframe_text_field) {
     [(NSTextField*)mainframe_text_field setTextColor : NSColor.whiteColor];
   }
+}
+
+void WKWebView_setDownloadRedirect(void* web, wxString target_dir, PluginDownloadCallback callback)
+{
+    WKWebView* webView = (WKWebView*)web;
+    if (!webView)
+        return;
+
+    auto config = std::make_shared<PluginDownloadRedirectConfig>(PluginDownloadRedirectConfig{std::move(target_dir), std::move(callback)});
+    OrcaWKDownloadContext* context = [[OrcaWKDownloadContext alloc] initWithConfig:std::move(config)];
+    objc_setAssociatedObject(webView, &g_orca_wk_download_context_key, context, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    install_wk_download_delegate_methods(webView);
+    [context release];
 }
 
 void WKWebView_evaluateJavaScript(void * web, wxString const & script, void (*callback)(wxString const &))
