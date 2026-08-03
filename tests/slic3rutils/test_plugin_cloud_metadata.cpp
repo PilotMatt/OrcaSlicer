@@ -7,6 +7,7 @@
 #include <slic3r/plugin/PluginManager.hpp>
 #include <slic3r/plugin/PythonInterpreter.hpp>
 #include <slic3r/plugin/PythonPluginInterface.hpp>
+#include <slic3r/Utils/OrcaCloudServiceAgent.hpp>
 
 #include "plugin_test_utils.hpp"
 
@@ -180,7 +181,18 @@ TEST_CASE("cloud metadata refresh preserves a plugin's stored config", "[PluginC
     CHECK_FALSE(orphaned.has_error());
     CHECK(orphaned.get_update_status() == PluginUpdateStatus::Normal);
 
-    // Orphaned is informational only: the local package must remain loadable and usable.
+    // Orphaned is informational only: the local package must remain loadable and usable. Loading
+    // it exercises get_storage_dir(), which for a cloud plugin needs a real logged-in session
+    // (PluginManager::get_storage_dir() throws otherwise) -- the same session a real user would
+    // already hold for a plugin they'd previously subscribed to and downloaded. Give the manager
+    // one via the real agent: OrcaCloudServiceAgent's constructor does no networking, and
+    // set_user_session(..., persist=false) only sets in-memory session state, so this stays a
+    // fast, offline unit test.
+    auto cloud_agent = std::make_shared<OrcaCloudServiceAgent>(get_orca_plugins_dir());
+    cloud_agent->set_user_session(/*token=*/"test-token", /*user_id=*/"test-user", /*username=*/"test-user",
+                                   /*nickname=*/"", /*avatar=*/"", /*refresh_token=*/"", /*persist=*/false);
+    manager.set_cloud_agent(cloud_agent);
+
     std::string load_error;
     manager.load_plugin(uuid, /*skip_deps=*/true);
     REQUIRE(manager.wait_for_plugin_load(uuid, std::chrono::seconds(120), load_error));

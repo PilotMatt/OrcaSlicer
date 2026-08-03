@@ -39,6 +39,7 @@ using Slic3r::GUI::unique_plugin_download_path;
 - (void)removeDownloadDelegate:(id)delegate;
 @end
 
+API_AVAILABLE(macos(11.3))
 @interface OrcaWKDownloadDelegate : NSObject <WKDownloadDelegate>
 {
     OrcaWKDownloadContext* m_context;
@@ -169,10 +170,14 @@ static void wk_decide_navigation_response(WKWebView* webView,
         should_download = should_download ||
             [disposition rangeOfString:@"attachment" options:NSCaseInsensitiveSearch].location != NSNotFound;
     }
-    decisionHandler(should_download ? WKNavigationResponsePolicyDownload : WKNavigationResponsePolicyAllow);
+    if (@available(macOS 11.3, *)) {
+        decisionHandler(should_download ? WKNavigationResponsePolicyDownload : WKNavigationResponsePolicyAllow);
+    } else {
+        decisionHandler(WKNavigationResponsePolicyAllow);
+    }
 }
 
-static void wk_did_become_download(WKWebView* webView, WKNavigationResponse*, WKDownload* download)
+static void wk_did_become_download(WKWebView* webView, WKNavigationResponse*, WKDownload* download) API_AVAILABLE(macos(11.3))
 {
     OrcaWKDownloadContext* context = wk_download_context(webView);
     if (!context)
@@ -197,7 +202,7 @@ static void wk_did_become_download_imp(id,
                                        SEL,
                                        WKWebView* webView,
                                        WKNavigationResponse* response,
-                                       WKDownload* download)
+                                       WKDownload* download) API_AVAILABLE(macos(11.3))
 {
     wk_did_become_download(webView, response, download);
 }
@@ -206,7 +211,7 @@ static void wk_did_become_action_download_imp(id,
                                               SEL,
                                               WKWebView* webView,
                                               WKNavigationAction* action,
-                                              WKDownload* download)
+                                              WKDownload* download) API_AVAILABLE(macos(11.3))
 {
     (void)action;
     OrcaWKDownloadContext* context = wk_download_context(webView);
@@ -229,14 +234,16 @@ static void install_wk_download_delegate_methods(WKWebView* webView)
                     @selector(webView:decidePolicyForNavigationResponse:decisionHandler:),
                     (IMP)wk_decide_navigation_response_imp,
                     "v@:@@@");
-    class_addMethod(delegateClass,
-                    @selector(webView:navigationResponse:didBecomeDownload:),
-                    (IMP)wk_did_become_download_imp,
-                    "v@:@@@");
-    class_addMethod(delegateClass,
-                    @selector(webView:navigationAction:didBecomeDownload:),
-                    (IMP)wk_did_become_action_download_imp,
-                    "v@:@@@");
+    if (@available(macOS 11.3, *)) {
+        class_addMethod(delegateClass,
+                        @selector(webView:navigationResponse:didBecomeDownload:),
+                        (IMP)wk_did_become_download_imp,
+                        "v@:@@@");
+        class_addMethod(delegateClass,
+                        @selector(webView:navigationAction:didBecomeDownload:),
+                        (IMP)wk_did_become_action_download_imp,
+                        "v@:@@@");
+    }
 }
 
 @implementation MacDarkMode
